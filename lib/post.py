@@ -2,112 +2,101 @@
 lib/post.py — shared helpers for Job365 sourcing API.
 
 Provides:
-  post_batch(jobs, dry_run)  — POST a list of job dicts to /api/internal/jobs/source
-  parse_salary(raw)          — parse salary strings into (min_lak, max_lak) or (None, None)
+  post_job(payload, dry_run)   — POST a single job to /api/internal/jobs/source
+  post_batch(jobs, dry_run)    — POST a list of job dicts with rate-limiting
+  parse_salary                 — re-exported from lib.normalize for back-compat
 """
-import os
-import re
 import logging
+import os
+import sys
+import time
+
 import requests
+
+from lib.normalize import parse_salary  # noqa: F401 — re-exported for back-compat
 
 log = logging.getLogger(__name__)
 
-JOB365_BASE_URL = os.environ.get("JOB365_BASE_URL", "https://job365.ai")
-JOB365_SOURCING_TOKEN = os.environ.get("JOB365_SOURCING_TOKEN", "")
+_BASE_URL = os.environ.get("JOB365_BASE_URL", "https://job365.ai")
+_ENDPOINT = f"{_BASE_URL}/api/internal/jobs/source"
 
-ENDPOINT = f"{JOB365_BASE_URL}/api/internal/jobs/source"
+_REQUIRED = ("title", "companyName", "location", "description")
 
-# ---------------------------------------------------------------------------
-# Salary helpers
-# ---------------------------------------------------------------------------
 
-_NUM_RE = re.compile(r"[\d,]+")
+def _token() -> str:
+    tok = os.environ.get("JOB365_SOURCING_TOKEN", "")
+    if not tok:
+        raise EnvironmentError("JOB365_SOURCING_TOKEN is not set — cannot post")
+    return tok
 
-def _clean_num(s: str) -> int | None:
-    """Strip commas and return int, or None if not parseable."""
-    s = s.replace(",", "").strip()
+
+def post_job(payload: dict, dry_run: bool = False) -> dict:
+    """
+    POST a single job dict to the Job365 sourcing endpoint.
+
+    Returns {"status": 201|409|4xx, ...response body...}.
+    Raises PermissionError on 401; raises EnvironmentError if token missing.
+    """
+    if dry_run:
+        log.info("[DRY-RUN] Would post: %s @ %s", payload.get("title"), payload.get("companyName"))
+        return {"status": "dry_run"}
+
+    headers = {
+        "Authorization": f"Bearer {_token()}",
+        "Content-Type": "application/json",
+        "User-Agent": "Job365-Scraper/1.0 (+https://job365.ai)",
+    }
+
+    resp = requests.post(_ENDPOINT, json=payload, headers=headers, timeout=15)
+
+    if resp.status_code == 401:
+        log.error("AUTH FAILURE — rotate JOB365_SOURCING_TOKEN immediately")
+        raise PermissionError("401 Unauthorized")
+
+    body: dict = {}
     try:
-        return int(s)
-    except ValueError:
-        return None
+        body = resp.json()
+    except Exception:
+        body = {"raw": resp.text}
+
+    if resp.status_code in (200, 201):
+        log.info("POSTED id=%s slug=%s title=%r", body.get("id"), body.get("slug"), payload.get("title"))
+    elif resp.status_code == 409:
+        log.debug("DUPLICATE (skipped): %s", payload.get("sourceUrl"))
+    else:
+        log.warning("HTTP %s for %r: %s", resp.status_code, payload.get("title"), body)
+
+    return {"status": resp.status_code, **body}
 
 
-def parse_salary(raw: str) -> tuple[int | None, int | None]:
+def post_batch(
+    jobs: list[dict],
+    delay_seconds: float = 1.0,
+    dry_run: bool = False,
+) -> list[dict]:
     """
-    Parse a raw salary string into (salary_min, salary_max) in LAK/month.
+    POST a list of job dicts with a polite delay between each request.
 
-    Examples handled:
-      "3,000,000 - 5,000,000 LAK"   -> (3000000, 5000000)
-      "5000000 kip"                  -> (5000000, None)
-      "$500 - $800"                  -> (None, None)   # USD — skip
-      ""                             -> (None, None)
+    Skips jobs missing required fields. Stops immediately on 401.
     """
-    if not raw:
-        return None, None
-
-    # Reject USD / THB / non-LAK currencies
-    if re.search(r"[$€£฿]|USD|THB|EUR", raw, re.I):
-        return None, None
-
-    nums = _NUM_RE.findall(raw)
-    if not nums:
-        return None, None
-
-    values = [_clean_num(n) for n in nums if _clean_num(n) is not None]
-
-    # Sanity: LAK monthly salary should be between 500k and 500M
-    values = [v for v in values if 500_000 <= v <= 500_000_000]
-
-    if not values:
-        return None, None
-    if len(values) == 1:
-        return values[0], None
-
-    low, high = min(values[0], values[1]), max(values[0], values[1])
-    return low, high
-
-
-# ---------------------------------------------------------------------------
-# POST helper
-# ---------------------------------------------------------------------------
-
-def post_batch(jobs: list[dict], dry_run: bool = False) -> None:
-    """
-    Post a list of job dicts to the Job365 sourcing endpoint.
-
-    Each dict should match the /api/internal/jobs/source request body contract.
-    Skips jobs missing required fields (title, companyName, location, description).
-    """
-    if not jobs:
-        return
-
-    required = ("title", "companyName", "location", "description")
-
-    for job in jobs:
-        missing = [f for f in required if not job.get(f)]
+    results: list[dict] = []
+    for i, job in enumerate(jobs):
+        missing = [f for f in _REQUIRED if not job.get(f)]
         if missing:
-            log.warning("Skipping job — missing required fields: %s | job=%s", missing, job.get("sourceUrl"))
+            log.warning(
+                "Skipping job %d — missing fields: %s | url=%s",
+                i, missing, job.get("sourceUrl"),
+            )
             continue
 
-        if dry_run:
-            log.info("[DRY-RUN] Would post: %s @ %s", job.get("title"), job.get("companyName"))
-            continue
-
-        if not JOB365_SOURCING_TOKEN:
-            log.error("JOB365_SOURCING_TOKEN is not set — cannot post.")
-            return
-
-        headers = {
-            "Authorization": f"Bearer {JOB365_SOURCING_TOKEN}",
-            "Content-Type": "application/json",
-        }
         try:
-            resp = requests.post(ENDPOINT, json=job, headers=headers, timeout=15)
-            if resp.status_code in (200, 201):
-                log.info("Posted: %s @ %s", job.get("title"), job.get("companyName"))
-            elif resp.status_code == 409:
-                log.debug("Duplicate (skipped): %s", job.get("sourceUrl"))
-            else:
-                log.warning("HTTP %s posting %s: %s", resp.status_code, job.get("sourceUrl"), resp.text[:200])
-        except requests.RequestException as exc:
-            log.error("Request error posting %s: %s", job.get("sourceUrl"), exc)
+            result = post_job(job, dry_run=dry_run)
+            results.append(result)
+        except PermissionError:
+            log.error("Stopping batch — token auth failed at item %d", i)
+            sys.exit(1)
+
+        if i < len(jobs) - 1:
+            time.sleep(delay_seconds)
+
+    return results

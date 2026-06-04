@@ -1,16 +1,9 @@
 """
 sources/108jobs/scrape.py — Scraper for 108.jobs (Lao job board).
 
-Features (PR #3):
-  - sourceType: BOARD by default; upgrades to EMPLOYER_DIRECT when employer
-    careers page is found and reachable.
-  - company block: logo, about, website, assetSourceUrl sent when available.
-  - category: inferred from title/description via CATEGORY_MAP (10-value map).
-  - skills: extracted from page tags/keywords section.
-  - type: FULL_TIME / PART_TIME / CONTRACT / INTERNSHIP / FREELANCE.
-  - salaryMin / salaryMax in LAK/month when shown.
-  - province: canonical province name from PROVINCE_MAP.
-  - companyDomain: extracted from company website URL.
+Fetches job listings from 108.jobs and posts them to the Job365 sourcing API
+via lib/post.py. All normalization (salary, province, category, type) is
+handled by lib/normalize.py.
 
 Run:
     export JOB365_SOURCING_TOKEN=...
@@ -28,7 +21,8 @@ import requests
 from bs4 import BeautifulSoup
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from lib.post import post_batch, parse_salary
+from lib.post import post_batch
+from lib.normalize import parse_salary, canonicalize_province, infer_category, infer_type
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -36,115 +30,19 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://www.108.jobs"
 SOURCE_ATTRIBUTION = "108.jobs"
 REQUEST_DELAY = 2.5
-ORIGIN_PROBE_TIMEOUT = 6  # seconds; kept short so we don't stall the pipeline
+ORIGIN_PROBE_TIMEOUT = 6
 
 HEADERS = {
     "User-Agent": "Job365-Scraper/1.0 (+https://job365.ai)",
     "Accept-Language": "lo, en;q=0.8",
 }
 
-# ---------------------------------------------------------------------------
-# Lookup maps
-# ---------------------------------------------------------------------------
-
-PROVINCE_MAP = {
-    "ວຽງຈັນ": "Vientiane",
-    "vientiane capital": "Vientiane",
-    "vientiane prefecture": "Vientiane",
-    "vientiane": "Vientiane",
-    "ສາວັນນະເຂດ": "Savannakhet",
-    "savannakhet": "Savannakhet",
-    "ຫຼວງພະບາງ": "Luang Prabang",
-    "luang prabang": "Luang Prabang",
-    "ຈຳປາສັກ": "Champasak",
-    "champasak": "Champasak",
-    "ປາກເຊ": "Champasak",
-    "pakse": "Champasak",
-    "ຄຳມ່ວນ": "Khammouane",
-    "khammouane": "Khammouane",
-    "ບໍລິຄຳໄຊ": "Bolikhamxai",
-    "bolikhamxai": "Bolikhamxai",
-    "ຫົວພັນ": "Houaphanh",
-    "houaphanh": "Houaphanh",
-    "ຫວ້ານ": "Houaphanh",
-    "ອຸດົມໄຊ": "Oudomxay",
-    "oudomxay": "Oudomxay",
-    "ໂຂງ": "Champasak",
-    "luang namtha": "Luang Namtha",
-    "bokeo": "Bokeo",
-    "phongsaly": "Phongsaly",
-    "saravane": "Saravane",
-    "sekong": "Sekong",
-    "xaisomboun": "Xaisomboun",
-    "xayaboury": "Xayaboury",
-    "xiengkhouang": "Xieng Khouang",
-    "xieng khouang": "Xieng Khouang",
-}
-
-# 10-value canonical category set; omit if ambiguous rather than guess
-CATEGORY_MAP = {
-    "information technology": "Technology",
-    "software": "Technology",
-    "developer": "Technology",
-    "programmer": "Technology",
-    "it support": "Technology",
-    "network": "Technology",
-    "data": "Technology",
-    "engineering": "Engineering",
-    "civil": "Engineering",
-    "electrical": "Engineering",
-    "mechanical": "Engineering",
-    "accounting": "Accounting & Finance",
-    "finance": "Accounting & Finance",
-    "audit": "Accounting & Finance",
-    "banking": "Banking & Finance",
-    "loan": "Banking & Finance",
-    "credit": "Banking & Finance",
-    "marketing": "Marketing",
-    "digital marketing": "Marketing",
-    "brand": "Marketing",
-    "sales": "Sales",
-    "business development": "Sales",
-    "human resource": "Human Resources",
-    "hr ": "Human Resources",
-    "recruitment": "Human Resources",
-    "administration": "Administration",
-    "admin": "Administration",
-    "secretary": "Administration",
-    "education": "Education",
-    "teacher": "Education",
-    "training": "Education",
-    "healthcare": "Healthcare",
-    "health": "Healthcare",
-    "nurse": "Healthcare",
-    "doctor": "Healthcare",
-    "hospitality": "Hospitality & Tourism",
-    "hotel": "Hospitality & Tourism",
-    "tourism": "Hospitality & Tourism",
-    "restaurant": "Hospitality & Tourism",
-    "logistics": "Logistics & Supply Chain",
-    "supply chain": "Logistics & Supply Chain",
-    "warehouse": "Logistics & Supply Chain",
-    "driver": "Logistics & Supply Chain",
-}
-
-TYPE_MAP = {
-    "full time": "FULL_TIME",
-    "fulltime": "FULL_TIME",
-    "full-time": "FULL_TIME",
-    "part time": "PART_TIME",
-    "parttime": "PART_TIME",
-    "part-time": "PART_TIME",
-    "contract": "CONTRACT",
-    "temporary": "TEMPORARY",
-    "internship": "INTERNSHIP",
-    "intern": "INTERNSHIP",
-    "freelance": "FREELANCE",
-}
-
 # Careers page paths to probe on employer websites
-CAREERS_PATHS = ["/careers", "/jobs", "/recruitment", "/vacancies",
-                 "/work-with-us", "/join-us", "/career"]
+CAREERS_PATHS = [
+    "/careers", "/jobs", "/recruitment", "/vacancies",
+    "/work-with-us", "/join-us", "/career",
+]
+
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -161,10 +59,9 @@ def _get(url: str, session: requests.Session, timeout: int = 15) -> BeautifulSou
 
 
 def _head_ok(url: str) -> bool:
-    """Return True if a HEAD request to url returns 2xx."""
+    """Return True if a HEAD request returns 2xx."""
     try:
-        r = requests.head(url, headers=HEADERS, timeout=ORIGIN_PROBE_TIMEOUT,
-                          allow_redirects=True)
+        r = requests.head(url, headers=HEADERS, timeout=ORIGIN_PROBE_TIMEOUT, allow_redirects=True)
         return 200 <= r.status_code < 300
     except requests.RequestException:
         return False
@@ -189,30 +86,6 @@ def _get_job_urls(soup: BeautifulSoup) -> list[str]:
 # Detail page parsers
 # ---------------------------------------------------------------------------
 
-def _normalise_province(raw: str) -> str | None:
-    low = raw.lower()
-    for key, prov in PROVINCE_MAP.items():
-        if key in low:
-            return prov
-    return None
-
-
-def _infer_category(text: str) -> str | None:
-    low = text.lower()
-    for keyword, cat in CATEGORY_MAP.items():
-        if keyword in low:
-            return cat
-    return None
-
-
-def _infer_type(text: str) -> str | None:
-    low = text.lower()
-    for keyword, jtype in TYPE_MAP.items():
-        if keyword in low:
-            return jtype
-    return None
-
-
 def _extract_skills(soup: BeautifulSoup) -> list[str]:
     skills = []
     for el in soup.select(".skill, .tag, .badge, [class*=skill], [class*=tag]"):
@@ -227,7 +100,6 @@ def _extract_company_url(soup: BeautifulSoup) -> str | None:
         href = a.get("href", "")
         if href.startswith("http") and "108.jobs" not in href:
             return href
-    # fallback: any external link near company section with "website" label
     for a in soup.select("a[href]"):
         href = a.get("href", "")
         text = a.get_text(strip=True).lower()
@@ -237,10 +109,7 @@ def _extract_company_url(soup: BeautifulSoup) -> str | None:
 
 
 def _probe_careers_page(company_url: str) -> str | None:
-    """
-    Try known careers paths on the employer's domain.
-    Returns the first reachable careers URL, or None.
-    """
+    """Try known careers paths on the employer domain; return first reachable URL."""
     parsed = urlparse(company_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
     for path in CAREERS_PATHS:
@@ -292,21 +161,21 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
         salary_min, salary_max = parse_salary(salary_raw)
 
         # Province
-        province = _normalise_province(location)
+        province = canonicalize_province(location)
 
-        # Category — try title first, then description
+        # Category — prefer title match, fall back to full text
         full_text = f"{title} {description}"
-        category = _infer_category(title) or _infer_category(full_text)
+        category = infer_category(title) or infer_category(full_text)
 
         # Job type
         type_el = soup.select_one("[class*=type], [class*=employment]")
         type_raw = type_el.get_text(strip=True) if type_el else ""
-        job_type = _infer_type(type_raw) or _infer_type(full_text) or "FULL_TIME"
+        job_type = infer_type(type_raw) or infer_type(full_text) or "FULL_TIME"
 
-        # Skills
+        # Skills from tag/badge elements
         skills = _extract_skills(soup)
 
-        # Company URL → origin-resolution
+        # Company domain for employer auto-claim
         company_url = _extract_company_url(soup)
         company_domain = None
         if company_url:
@@ -316,10 +185,9 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
 
         logo_url = _extract_logo_url(soup, url)
 
-        # Origin resolution
+        # Origin resolution: upgrade to EMPLOYER_DIRECT when careers page found
         source_type = "BOARD"
         source_url = url
-        careers_url = None
         if company_url:
             careers_url = _probe_careers_page(company_url)
             if careers_url:
@@ -343,7 +211,7 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
             payload["category"] = category
         if skills:
             payload["skills"] = skills
-        if job_type != "FULL_TIME":  # only send non-default to keep payload lean
+        if job_type != "FULL_TIME":
             payload["type"] = job_type
         if salary_min is not None:
             payload["salaryMin"] = salary_min
@@ -352,11 +220,11 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
         if company_domain:
             payload["companyDomain"] = company_domain
 
-        # Company block (non-destructive shadow profile enrichment)
+        # Company block for shadow-profile enrichment (non-destructive)
         company_block: dict = {}
         if company_url:
             company_block["website"] = company_url
-            company_block["assetSourceUrl"] = url  # 108.jobs detail page = asset origin
+            company_block["assetSourceUrl"] = url
         if logo_url:
             company_block["logoUrl"] = logo_url
         if company_block:
@@ -376,7 +244,6 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
 def scrape(max_pages: int = 5, dry_run: bool = False) -> None:
     session = requests.Session()
     batch: list[dict] = []
-    stats = {"new": 0, "dup": 0, "upgraded": 0}
 
     for page in range(1, max_pages + 1):
         listing_url = f"{BASE_URL}/jobs?page={page}"
@@ -400,8 +267,6 @@ def scrape(max_pages: int = 5, dry_run: bool = False) -> None:
                 continue
             payload = _parse_job(detail_soup, job_url)
             if payload:
-                if payload.get("sourceType") == "EMPLOYER_DIRECT":
-                    stats["upgraded"] += 1
                 batch.append(payload)
 
         if batch:
@@ -410,10 +275,7 @@ def scrape(max_pages: int = 5, dry_run: bool = False) -> None:
 
         time.sleep(REQUEST_DELAY)
 
-    log.info(
-        "Done — new=%s dup=%s upgraded_to_direct=%s",
-        stats["new"], stats["dup"], stats["upgraded"],
-    )
+    log.info("Done.")
 
 
 def main() -> None:

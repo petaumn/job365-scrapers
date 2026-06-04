@@ -1,4 +1,4 @@
-from lib.post import parse_salary
+from lib.normalize import parse_salary
 
 
 def test_range_lak():
