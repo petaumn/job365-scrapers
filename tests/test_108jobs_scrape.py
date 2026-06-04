@@ -23,44 +23,45 @@ _infer_category = _mod._infer_category
 _infer_type = _mod._infer_type
 
 
-# --- province ---
+# --- province (canonical slugs per docs/scrapers-contract.md) ---
 
 def test_province_lao_vientiane():
-    assert _normalise_province("ວຽງຈັນ") == "Vientiane"
+    assert _normalise_province("ວຽງຈັນ") == "vientiane-capital"
 
 
 def test_province_english_capital():
-    assert _normalise_province("Vientiane Capital") == "Vientiane"
+    assert _normalise_province("Vientiane Capital") == "vientiane-capital"
 
 
 def test_province_savannakhet():
-    assert _normalise_province("Savannakhet Province") == "Savannakhet"
+    assert _normalise_province("Savannakhet Province") == "savannakhet"
 
 
 def test_province_luang_prabang():
-    assert _normalise_province("Luang Prabang") == "Luang Prabang"
+    assert _normalise_province("Luang Prabang") == "luang-prabang"
 
 
 def test_province_pakse_maps_champasak():
-    assert _normalise_province("Pakse") == "Champasak"
+    assert _normalise_province("Pakse") == "champasak"
 
 
 def test_province_remote_returns_none():
     assert _normalise_province("Online / Remote") is None
 
 
-# --- category ---
+# --- category (10 canonical Job365 values) ---
 
 def test_category_software():
-    assert _infer_category("Software Developer") == "Technology"
+    assert _infer_category("Software Developer") == "Engineering & IT"
 
 
 def test_category_it_support():
-    assert _infer_category("IT Support Officer") == "Technology"
+    assert _infer_category("IT Support Officer") == "Engineering & IT"
 
 
 def test_category_accounting():
-    assert _infer_category("Accounting Officer") == "Accounting & Finance"
+    # "Accounting" maps to Banking & Finance per the canonical mapping
+    assert _infer_category("Accounting Officer") == "Banking & Finance"
 
 
 def test_category_banking():
@@ -68,7 +69,7 @@ def test_category_banking():
 
 
 def test_category_hr():
-    assert _infer_category("Human Resource Manager") == "Human Resources"
+    assert _infer_category("Human Resource Manager") == "Admin & HR"
 
 
 def test_category_none_for_generic():
