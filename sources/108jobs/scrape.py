@@ -1,15 +1,15 @@
 """
 sources/108jobs/scrape.py — Scraper for 108.jobs (Lao job board).
 
-Features (PR #3):
+PR #3 features:
   - sourceType: BOARD by default; upgrades to EMPLOYER_DIRECT when employer
     careers page is found and reachable.
-  - company block: logo, about, website, assetSourceUrl sent when available.
-  - category: inferred from title/description via CATEGORY_MAP (10-value map).
+  - company block: logo, about, website, socials, assetSourceUrl sent when available.
+  - category: mapped to the 10 canonical Job365 categories; omitted when ambiguous.
   - skills: extracted from page tags/keywords section.
   - type: FULL_TIME / PART_TIME / CONTRACT / INTERNSHIP / FREELANCE.
   - salaryMin / salaryMax in LAK/month when shown.
-  - province: canonical province name from PROVINCE_MAP.
+  - province: canonical slug (e.g. "vientiane-capital", "savannakhet").
   - companyDomain: extracted from company website URL.
 
 Run:
@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://www.108.jobs"
 SOURCE_ATTRIBUTION = "108.jobs"
 REQUEST_DELAY = 2.5
-ORIGIN_PROBE_TIMEOUT = 6  # seconds; kept short so we don't stall the pipeline
+ORIGIN_PROBE_TIMEOUT = 6  # kept short so we don't stall the pipeline
 
 HEADERS = {
     "User-Agent": "Job365-Scraper/1.0 (+https://job365.ai)",
@@ -44,91 +44,179 @@ HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
-# Lookup maps
+# Province display name / Lao script → canonical slug
+# Slugs match src/lib/data/provinces.ts on the Job365 platform.
 # ---------------------------------------------------------------------------
 
-PROVINCE_MAP = {
-    "ວຽງຈັນ": "Vientiane",
-    "vientiane capital": "Vientiane",
-    "vientiane prefecture": "Vientiane",
-    "vientiane": "Vientiane",
-    "ສາວັນນະເຂດ": "Savannakhet",
-    "savannakhet": "Savannakhet",
-    "ຫຼວງພະບາງ": "Luang Prabang",
-    "luang prabang": "Luang Prabang",
-    "ຈຳປາສັກ": "Champasak",
-    "champasak": "Champasak",
-    "ປາກເຊ": "Champasak",
-    "pakse": "Champasak",
-    "ຄຳມ່ວນ": "Khammouane",
-    "khammouane": "Khammouane",
-    "ບໍລິຄຳໄຊ": "Bolikhamxai",
-    "bolikhamxai": "Bolikhamxai",
-    "ຫົວພັນ": "Houaphanh",
-    "houaphanh": "Houaphanh",
-    "ຫວ້ານ": "Houaphanh",
-    "ອຸດົມໄຊ": "Oudomxay",
-    "oudomxay": "Oudomxay",
-    "ໂຂງ": "Champasak",
-    "luang namtha": "Luang Namtha",
-    "bokeo": "Bokeo",
-    "phongsaly": "Phongsaly",
-    "saravane": "Saravane",
-    "sekong": "Sekong",
-    "xaisomboun": "Xaisomboun",
-    "xayaboury": "Xayaboury",
-    "xiengkhouang": "Xieng Khouang",
-    "xieng khouang": "Xieng Khouang",
+PROVINCE_MAP: dict[str, str] = {
+    # Vientiane Capital
+    "ນະຄອນຫຼວວຽງຈັນ": "vientiane-capital",
+    "vientiane capital": "vientiane-capital",
+    "vientiane prefecture": "vientiane-capital",
+    "nakhon luang vientiane": "vientiane-capital",
+    # plain "vientiane" → capital (most 108.jobs listings mean the capital)
+    "vientiane": "vientiane-capital",
+    "ວຽງຈັນ": "vientiane-capital",
+    # Vientiane Province (only when "province" qualifier is present)
+    "ແຂວງວຽງຈັນ": "vientiane",
+    "vientiane province": "vientiane",
+    # Savannakhet
+    "ສະຫວັນນະເຂດ": "savannakhet",
+    "savannakhet": "savannakhet",
+    # Luang Prabang
+    "ຫຼວງພະບາງ": "luang-prabang",
+    "luang prabang": "luang-prabang",
+    # Champasak / Pakse
+    "ຈຳປາສັກ": "champasak",
+    "champasak": "champasak",
+    "ປາກເສ": "champasak",
+    "pakse": "champasak",
+    # Khammouane
+    "ຄຳມ່ວນ": "khammouane",
+    "khammouane": "khammouane",
+    # Bolikhamsai
+    "ບອລິຄຳໄສ": "bolikhamsai",
+    "bolikhamsai": "bolikhamsai",
+    "bolikhamxai": "bolikhamsai",
+    # Houaphanh
+    "ຫວຣພັນ": "houaphanh",
+    "houaphanh": "houaphanh",
+    # Oudomxay
+    "ອຸດົມໄສ": "oudomxay",
+    "oudomxay": "oudomxay",
+    # Bokeo
+    "ບອ່ແກ້ວ": "bokeo",
+    "bokeo": "bokeo",
+    # Xieng Khouang
+    "ຊຽງຂວາງ": "xieng-khouang",
+    "xieng khouang": "xieng-khouang",
+    "xiengkhouang": "xieng-khouang",
+    # Phongsaly
+    "ຜົ້ງສາລີ": "phongsaly",
+    "phongsaly": "phongsaly",
+    # Attapeu
+    "ອັດຕະປື": "attapeu",
+    "attapeu": "attapeu",
+    # Sekong
+    "ເຊກອງ": "sekong",
+    "sekong": "sekong",
+    # Xaisomboun
+    "ໄສສົມບູນ": "xaisomboun",
+    "xaisomboun": "xaisomboun",
+    # Salavan
+    "ສາລະວັນ": "salavan",
+    "saravane": "salavan",
+    "salavan": "salavan",
+    # Xayaboury
+    "ໄສຍະບູລີ": "xayaboury",
+    "xayaboury": "xayaboury",
+    # Luang Namtha
+    "ຫຼວງນ້ຳທາ": "luang-namtha",
+    "luang namtha": "luang-namtha",
 }
 
-# 10-value canonical category set; omit if ambiguous rather than guess
-CATEGORY_MAP = {
-    "information technology": "Technology",
-    "software": "Technology",
-    "developer": "Technology",
-    "programmer": "Technology",
-    "it support": "Technology",
-    "network": "Technology",
-    "data": "Technology",
-    "engineering": "Engineering",
-    "civil": "Engineering",
-    "electrical": "Engineering",
-    "mechanical": "Engineering",
-    "accounting": "Accounting & Finance",
-    "finance": "Accounting & Finance",
-    "audit": "Accounting & Finance",
-    "banking": "Banking & Finance",
-    "loan": "Banking & Finance",
-    "credit": "Banking & Finance",
-    "marketing": "Marketing",
-    "digital marketing": "Marketing",
-    "brand": "Marketing",
-    "sales": "Sales",
-    "business development": "Sales",
-    "human resource": "Human Resources",
-    "hr ": "Human Resources",
-    "recruitment": "Human Resources",
-    "administration": "Administration",
-    "admin": "Administration",
-    "secretary": "Administration",
-    "education": "Education",
-    "teacher": "Education",
-    "training": "Education",
-    "healthcare": "Healthcare",
-    "health": "Healthcare",
-    "nurse": "Healthcare",
-    "doctor": "Healthcare",
-    "hospitality": "Hospitality & Tourism",
-    "hotel": "Hospitality & Tourism",
-    "tourism": "Hospitality & Tourism",
-    "restaurant": "Hospitality & Tourism",
-    "logistics": "Logistics & Supply Chain",
-    "supply chain": "Logistics & Supply Chain",
-    "warehouse": "Logistics & Supply Chain",
-    "driver": "Logistics & Supply Chain",
-}
+# ---------------------------------------------------------------------------
+# Keyword → canonical Job365 category (10 values only; ordered list, first hit wins)
+# Omit category entirely when ambiguous — server infers from title/description.
+# ---------------------------------------------------------------------------
 
-TYPE_MAP = {
+CATEGORY_MAP: list[tuple[str, str]] = [
+    # Engineering & IT — specific tech terms checked before broad "engineering"
+    ("software", "Engineering & IT"),
+    ("developer", "Engineering & IT"),
+    ("programmer", "Engineering & IT"),
+    ("information technology", "Engineering & IT"),
+    ("it support", "Engineering & IT"),
+    ("network engineer", "Engineering & IT"),
+    ("cyber", "Engineering & IT"),
+    ("data analyst", "Engineering & IT"),
+    ("data scientist", "Engineering & IT"),
+    ("system admin", "Engineering & IT"),
+    ("web developer", "Engineering & IT"),
+    ("mobile developer", "Engineering & IT"),
+    # Banking & Finance
+    ("banking", "Banking & Finance"),
+    ("bank ", "Banking & Finance"),
+    ("finance manager", "Banking & Finance"),
+    ("accountant", "Banking & Finance"),
+    ("accounting", "Banking & Finance"),
+    ("audit", "Banking & Finance"),
+    ("insurance", "Banking & Finance"),
+    ("loan officer", "Banking & Finance"),
+    ("credit analyst", "Banking & Finance"),
+    ("treasurer", "Banking & Finance"),
+    # Sales & Marketing
+    ("sales", "Sales & Marketing"),
+    ("marketing", "Sales & Marketing"),
+    ("brand", "Sales & Marketing"),
+    ("business development", "Sales & Marketing"),
+    ("digital marketing", "Sales & Marketing"),
+    ("social media", "Sales & Marketing"),
+    ("communications", "Sales & Marketing"),
+    ("customer success", "Sales & Marketing"),
+    # NGO & Development
+    ("ngo", "NGO & Development"),
+    ("ingo", "NGO & Development"),
+    ("development officer", "NGO & Development"),
+    ("programme officer", "NGO & Development"),
+    ("project coordinator", "NGO & Development"),
+    ("humanitarian", "NGO & Development"),
+    ("united nations", "NGO & Development"),
+    # Education & Training
+    ("teacher", "Education & Training"),
+    ("education", "Education & Training"),
+    ("training officer", "Education & Training"),
+    ("lecturer", "Education & Training"),
+    ("tutor", "Education & Training"),
+    # Healthcare
+    ("doctor", "Healthcare"),
+    ("nurse", "Healthcare"),
+    ("healthcare", "Healthcare"),
+    ("medical", "Healthcare"),
+    ("pharmacist", "Healthcare"),
+    ("clinic", "Healthcare"),
+    ("hospital", "Healthcare"),
+    # Hospitality & Tourism
+    ("hotel", "Hospitality & Tourism"),
+    ("hospitality", "Hospitality & Tourism"),
+    ("tourism", "Hospitality & Tourism"),
+    ("restaurant", "Hospitality & Tourism"),
+    ("chef", "Hospitality & Tourism"),
+    ("front desk", "Hospitality & Tourism"),
+    ("barista", "Hospitality & Tourism"),
+    # Logistics & Supply Chain
+    ("logistics", "Logistics & Supply Chain"),
+    ("supply chain", "Logistics & Supply Chain"),
+    ("warehouse", "Logistics & Supply Chain"),
+    ("procurement", "Logistics & Supply Chain"),
+    ("driver", "Logistics & Supply Chain"),
+    ("delivery", "Logistics & Supply Chain"),
+    ("import", "Logistics & Supply Chain"),
+    ("export", "Logistics & Supply Chain"),
+    # Manufacturing — civil/mechanical/electrical engineer before generic "engineering"
+    ("civil engineer", "Manufacturing"),
+    ("electrical engineer", "Manufacturing"),
+    ("mechanical engineer", "Manufacturing"),
+    ("manufacturing", "Manufacturing"),
+    ("production", "Manufacturing"),
+    ("construction", "Manufacturing"),
+    ("factory", "Manufacturing"),
+    ("quality control", "Manufacturing"),
+    # Admin & HR — broad terms placed last to avoid false positives
+    ("human resource", "Admin & HR"),
+    ("hr manager", "Admin & HR"),
+    ("recruitment", "Admin & HR"),
+    ("administration", "Admin & HR"),
+    ("secretary", "Admin & HR"),
+    ("receptionist", "Admin & HR"),
+    ("office manager", "Admin & HR"),
+    ("legal", "Admin & HR"),
+    ("compliance", "Admin & HR"),
+    ("operations manager", "Admin & HR"),
+    ("customer service", "Admin & HR"),
+]
+
+TYPE_MAP: dict[str, str] = {
     "full time": "FULL_TIME",
     "fulltime": "FULL_TIME",
     "full-time": "FULL_TIME",
@@ -142,9 +230,10 @@ TYPE_MAP = {
     "freelance": "FREELANCE",
 }
 
-# Careers page paths to probe on employer websites
-CAREERS_PATHS = ["/careers", "/jobs", "/recruitment", "/vacancies",
-                 "/work-with-us", "/join-us", "/career"]
+CAREERS_PATHS = [
+    "/careers", "/jobs", "/recruitment", "/vacancies",
+    "/work-with-us", "/join-us", "/career",
+]
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -190,16 +279,22 @@ def _get_job_urls(soup: BeautifulSoup) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _normalise_province(raw: str) -> str | None:
-    low = raw.lower()
-    for key, prov in PROVINCE_MAP.items():
-        if key in low:
-            return prov
-    return None
+    """Return canonical province slug, or None when unrecognisable."""
+    low = raw.lower().strip()
+    if low in PROVINCE_MAP:
+        return PROVINCE_MAP[low]
+    # Substring match — longest key wins
+    best_len, best_slug = 0, None
+    for key, slug in PROVINCE_MAP.items():
+        if key in low and len(key) > best_len:
+            best_len, best_slug = len(key), slug
+    return best_slug
 
 
 def _infer_category(text: str) -> str | None:
+    """First-match on ordered CATEGORY_MAP; returns None when ambiguous."""
     low = text.lower()
-    for keyword, cat in CATEGORY_MAP.items():
+    for keyword, cat in CATEGORY_MAP:
         if keyword in low:
             return cat
     return None
@@ -219,7 +314,7 @@ def _extract_skills(soup: BeautifulSoup) -> list[str]:
         text = el.get_text(strip=True)
         if 2 <= len(text) <= 40:
             skills.append(text)
-    return list(dict.fromkeys(skills))[:8]  # dedup, cap at 8
+    return list(dict.fromkeys(skills))[:8]
 
 
 def _extract_company_url(soup: BeautifulSoup) -> str | None:
@@ -227,7 +322,6 @@ def _extract_company_url(soup: BeautifulSoup) -> str | None:
         href = a.get("href", "")
         if href.startswith("http") and "108.jobs" not in href:
             return href
-    # fallback: any external link near company section with "website" label
     for a in soup.select("a[href]"):
         href = a.get("href", "")
         text = a.get_text(strip=True).lower()
@@ -237,10 +331,7 @@ def _extract_company_url(soup: BeautifulSoup) -> str | None:
 
 
 def _probe_careers_page(company_url: str) -> str | None:
-    """
-    Try known careers paths on the employer's domain.
-    Returns the first reachable careers URL, or None.
-    """
+    """Return the first reachable careers URL on the employer's domain, or None."""
     parsed = urlparse(company_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
     for path in CAREERS_PATHS:
@@ -258,6 +349,83 @@ def _extract_logo_url(soup: BeautifulSoup, source_url: str) -> str | None:
     return None
 
 
+def _extract_company_about(soup: BeautifulSoup) -> str | None:
+    """Extract company description from the employer section of the listing."""
+    for el in soup.select(
+        "[class*=company-about], [class*=company-desc], "
+        "[class*=about-company], [class*=employer-desc], [class*=company-info]"
+    ):
+        text = el.get_text(separator=" ", strip=True)
+        if len(text) >= 40:
+            return text[:500]
+    return None
+
+
+def _extract_social_links(soup: BeautifulSoup) -> dict[str, str]:
+    """Extract Facebook and LinkedIn page links. Skips auth-walled profile URLs."""
+    socials: dict[str, str] = {}
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if "facebook.com" in href and "facebookUrl" not in socials:
+            # Only public page URLs (not auth-required /login redirects)
+            if "/login" not in href and "/l.php" not in href:
+                socials["facebookUrl"] = href
+        elif "linkedin.com/company" in href and "linkedinUrl" not in socials:
+            socials["linkedinUrl"] = href
+    return socials
+
+
+# ---------------------------------------------------------------------------
+# Factual summary for BOARD fallback
+# ---------------------------------------------------------------------------
+
+def _build_factual_summary(
+    title: str,
+    company: str,
+    location: str,
+    description_raw: str,
+    skills: list[str],
+    salary_min: int | None,
+    salary_max: int | None,
+    job_type: str,
+) -> str:
+    """
+    Compose a factual description from structured listing data.
+    Goal: >= 120 chars, no verbatim copy of the board's expressive prose.
+    Falls back to truncated raw text when structured data is insufficient.
+    """
+    parts: list[str] = []
+
+    parts.append(f"{company} is hiring a {title} based in {location}.")
+
+    if job_type and job_type != "FULL_TIME":
+        label = job_type.replace("_", " ").title()
+        parts.append(f"This is a {label} position.")
+
+    if salary_min and salary_max:
+        parts.append(f"Salary: {salary_min:,}–{salary_max:,} LAK/month.")
+    elif salary_min:
+        parts.append(f"Salary from {salary_min:,} LAK/month.")
+
+    if skills:
+        parts.append(f"Key skills: {', '.join(skills[:5])}.")
+
+    # Pull short fact-lines from raw description (responsibilities / requirements)
+    if description_raw:
+        lines = [ln.strip() for ln in description_raw.splitlines() if ln.strip()]
+        fact_lines = [ln for ln in lines if 10 <= len(ln) <= 120][:3]
+        if fact_lines:
+            parts.extend(fact_lines)
+
+    summary = " ".join(parts)
+
+    # Fallback: if structured data alone is too thin, use truncated raw text
+    if len(summary) < 120 and description_raw:
+        summary = description_raw[:600].strip()
+
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # Main job parser
 # ---------------------------------------------------------------------------
@@ -271,19 +439,17 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
         company = company_el.get_text(strip=True) if company_el else None
 
         location_el = soup.select_one(".location, [class*=location], [class*=province]")
-        location = location_el.get_text(strip=True) if location_el else "Laos"
+        location = location_el.get_text(strip=True) if location_el else "Vientiane"
 
         description_el = soup.select_one(
             ".job-description, .description, [class*=description], article"
         )
-        description = (
-            description_el.get_text(separator="\n", strip=True) if description_el else None
+        description_raw = (
+            description_el.get_text(separator="\n", strip=True) if description_el else ""
         )
-        if description:
-            description = description[:4000]
 
-        if not title or not company or not description:
-            log.debug("Skipping %s — missing title/company/description", url)
+        if not title or not company:
+            log.debug("Skipping %s — missing title/company", url)
             return None
 
         # Salary
@@ -291,41 +457,50 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
         salary_raw = salary_el.get_text(strip=True) if salary_el else ""
         salary_min, salary_max = parse_salary(salary_raw)
 
-        # Province
+        # Province slug
         province = _normalise_province(location)
 
-        # Category — try title first, then description
-        full_text = f"{title} {description}"
-        category = _infer_category(title) or _infer_category(full_text)
+        # Category: title first (more signal-dense), then full text
+        category = _infer_category(title) or _infer_category(description_raw)
 
         # Job type
         type_el = soup.select_one("[class*=type], [class*=employment]")
         type_raw = type_el.get_text(strip=True) if type_el else ""
-        job_type = _infer_type(type_raw) or _infer_type(full_text) or "FULL_TIME"
+        job_type = _infer_type(type_raw) or _infer_type(description_raw) or "FULL_TIME"
 
         # Skills
         skills = _extract_skills(soup)
 
-        # Company URL → origin-resolution
+        # Company URL and domain
         company_url = _extract_company_url(soup)
-        company_domain = None
+        company_domain: str | None = None
         if company_url:
             m = re.search(r"https?://(?:www\.)?([^/]+)", company_url)
             if m:
                 company_domain = m.group(1)
 
         logo_url = _extract_logo_url(soup, url)
+        company_about = _extract_company_about(soup)
+        social_links = _extract_social_links(soup)
 
         # Origin resolution
         source_type = "BOARD"
         source_url = url
-        careers_url = None
         if company_url:
             careers_url = _probe_careers_page(company_url)
             if careers_url:
                 source_type = "EMPLOYER_DIRECT"
                 source_url = careers_url
-                log.info("    ↑ Upgraded to EMPLOYER_DIRECT: %s", careers_url)
+                log.info("    ↑ EMPLOYER_DIRECT: %s", careers_url)
+
+        # Factual description (no verbatim board copy)
+        description = _build_factual_summary(
+            title, company, location, description_raw,
+            skills, salary_min, salary_max, job_type,
+        )
+        if not description:
+            log.debug("Skipping %s — empty description", url)
+            return None
 
         payload: dict = {
             "title": title,
@@ -335,6 +510,7 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
             "sourceUrl": source_url,
             "sourceAttribution": SOURCE_ATTRIBUTION,
             "sourceType": source_type,
+            "type": job_type,
         }
 
         if province:
@@ -343,8 +519,6 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
             payload["category"] = category
         if skills:
             payload["skills"] = skills
-        if job_type != "FULL_TIME":  # only send non-default to keep payload lean
-            payload["type"] = job_type
         if salary_min is not None:
             payload["salaryMin"] = salary_min
         if salary_max is not None:
@@ -352,13 +526,16 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
         if company_domain:
             payload["companyDomain"] = company_domain
 
-        # Company block (non-destructive shadow profile enrichment)
+        # Company block — feeds shadow profile (non-destructive; unclaimed orgs only)
         company_block: dict = {}
         if company_url:
             company_block["website"] = company_url
-            company_block["assetSourceUrl"] = url  # 108.jobs detail page = asset origin
+            company_block["assetSourceUrl"] = url  # 108.jobs page is the asset origin
         if logo_url:
             company_block["logoUrl"] = logo_url
+        if company_about:
+            company_block["about"] = company_about
+        company_block.update(social_links)
         if company_block:
             payload["company"] = company_block
 
@@ -376,7 +553,7 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
 def scrape(max_pages: int = 5, dry_run: bool = False) -> None:
     session = requests.Session()
     batch: list[dict] = []
-    stats = {"new": 0, "dup": 0, "upgraded": 0}
+    stats = {"total": 0, "upgraded": 0, "with_salary": 0, "with_skills": 0}
 
     for page in range(1, max_pages + 1):
         listing_url = f"{BASE_URL}/jobs?page={page}"
@@ -400,8 +577,13 @@ def scrape(max_pages: int = 5, dry_run: bool = False) -> None:
                 continue
             payload = _parse_job(detail_soup, job_url)
             if payload:
+                stats["total"] += 1
                 if payload.get("sourceType") == "EMPLOYER_DIRECT":
                     stats["upgraded"] += 1
+                if payload.get("salaryMin"):
+                    stats["with_salary"] += 1
+                if payload.get("skills"):
+                    stats["with_skills"] += 1
                 batch.append(payload)
 
         if batch:
@@ -410,9 +592,13 @@ def scrape(max_pages: int = 5, dry_run: bool = False) -> None:
 
         time.sleep(REQUEST_DELAY)
 
+    total = max(stats["total"], 1)
     log.info(
-        "Done — new=%s dup=%s upgraded_to_direct=%s",
-        stats["new"], stats["dup"], stats["upgraded"],
+        "Done — total=%d  employer_direct=%d (%.0f%%)  salary=%d (%.0f%%)  skills=%d (%.0f%%)",
+        stats["total"],
+        stats["upgraded"], 100 * stats["upgraded"] / total,
+        stats["with_salary"], 100 * stats["with_salary"] / total,
+        stats["with_skills"], 100 * stats["with_skills"] / total,
     )
 
 
