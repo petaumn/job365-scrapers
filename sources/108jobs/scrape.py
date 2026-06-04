@@ -1,15 +1,15 @@
 """
 sources/108jobs/scrape.py — Scraper for 108.jobs (Lao job board).
 
-Features (PR #3):
+Features (PR #3 + fix):
   - sourceType: BOARD by default; upgrades to EMPLOYER_DIRECT when employer
     careers page is found and reachable.
   - company block: logo, about, website, assetSourceUrl sent when available.
-  - category: inferred from title/description via CATEGORY_MAP (10-value map).
+  - category: inferred from title/description via CATEGORY_MAP (10-value canonical set).
   - skills: extracted from page tags/keywords section.
   - type: FULL_TIME / PART_TIME / CONTRACT / INTERNSHIP / FREELANCE.
   - salaryMin / salaryMax in LAK/month when shown.
-  - province: canonical province name from PROVINCE_MAP.
+  - province: canonical province slug from PROVINCE_MAP (e.g. vientiane-capital).
   - companyDomain: extracted from company website URL.
 
 Run:
@@ -47,87 +47,150 @@ HEADERS = {
 # Lookup maps
 # ---------------------------------------------------------------------------
 
+# Canonical province slugs — confirmed in job365.ai#225.
+# Vientiane Capital (ນະຄອນຫຼວງວຽງຈັນ) and Vientiane Province (ແຂວງວຽງຈັນ)
+# are distinct; bare "vientiane" maps to the capital (most common on 108.jobs).
 PROVINCE_MAP = {
-    "ວຽງຈັນ": "Vientiane",
-    "vientiane capital": "Vientiane",
-    "vientiane prefecture": "Vientiane",
-    "vientiane": "Vientiane",
-    "ສາວັນນະເຂດ": "Savannakhet",
-    "savannakhet": "Savannakhet",
-    "ຫຼວງພະບາງ": "Luang Prabang",
-    "luang prabang": "Luang Prabang",
-    "ຈຳປາສັກ": "Champasak",
-    "champasak": "Champasak",
-    "ປາກເຊ": "Champasak",
-    "pakse": "Champasak",
-    "ຄຳມ່ວນ": "Khammouane",
-    "khammouane": "Khammouane",
-    "ບໍລິຄຳໄຊ": "Bolikhamxai",
-    "bolikhamxai": "Bolikhamxai",
-    "ຫົວພັນ": "Houaphanh",
-    "houaphanh": "Houaphanh",
-    "ຫວ້ານ": "Houaphanh",
-    "ອຸດົມໄຊ": "Oudomxay",
-    "oudomxay": "Oudomxay",
-    "ໂຂງ": "Champasak",
-    "luang namtha": "Luang Namtha",
-    "bokeo": "Bokeo",
-    "phongsaly": "Phongsaly",
-    "saravane": "Saravane",
-    "sekong": "Sekong",
-    "xaisomboun": "Xaisomboun",
-    "xayaboury": "Xayaboury",
-    "xiengkhouang": "Xieng Khouang",
-    "xieng khouang": "Xieng Khouang",
+    # Vientiane Capital
+    "ນະຄອນຫຼວງວຽງຈັນ": "vientiane-capital",
+    "nakhon luang vientiane": "vientiane-capital",
+    "vientiane capital": "vientiane-capital",
+    "vientiane prefecture": "vientiane-capital",
+    "vientiane": "vientiane-capital",
+    "ວຽງຈັນ": "vientiane-capital",
+    # Vientiane Province (must appear after the capital keys)
+    "ແຂວງວຽງຈັນ": "vientiane",
+    "vientiane province": "vientiane",
+    # Savannakhet
+    "ສະຫວັນນະເຂດ": "savannakhet",
+    "ສາວັນນະເຂດ": "savannakhet",
+    "savannakhet": "savannakhet",
+    # Luang Prabang
+    "ຫຼວງພະບາງ": "luang-prabang",
+    "luang prabang": "luang-prabang",
+    # Champasak
+    "ຈຳປາສັກ": "champasak",
+    "champasak": "champasak",
+    "ປາກເຊ": "champasak",
+    "pakse": "champasak",
+    # Khammouane
+    "ຄຳມ່ວນ": "khammouane",
+    "khammouane": "khammouane",
+    # Bolikhamsai
+    "ບໍລິຄຳໄຊ": "bolikhamsai",
+    "bolikhamsai": "bolikhamsai",
+    "bolikhamxai": "bolikhamsai",
+    # Houaphanh
+    "ຫົວພັນ": "houaphanh",
+    "houaphanh": "houaphanh",
+    # Oudomxay
+    "ອຸດົມໄຊ": "oudomxay",
+    "oudomxay": "oudomxay",
+    # Luang Namtha
+    "ຫຼວງນ້ຳທາ": "luang-namtha",
+    "luang namtha": "luang-namtha",
+    # Bokeo
+    "ບໍ່ແກ້ວ": "bokeo",
+    "bokeo": "bokeo",
+    # Phongsaly
+    "ຜົ້ງສາລີ": "phongsaly",
+    "phongsaly": "phongsaly",
+    # Salavan
+    "ສາລະວັນ": "salavan",
+    "salavan": "salavan",
+    "saravane": "salavan",
+    # Sekong
+    "ເຊກອງ": "sekong",
+    "sekong": "sekong",
+    # Xaisomboun
+    "ໄຊສົມບູນ": "xaisomboun",
+    "xaisomboun": "xaisomboun",
+    # Xayaboury
+    "ໄຊຍະບູລີ": "xayaboury",
+    "xayaboury": "xayaboury",
+    # Xieng Khouang
+    "ຊຽງຂວາງ": "xieng-khouang",
+    "xieng khouang": "xieng-khouang",
+    "xiengkhouang": "xieng-khouang",
+    # Attapeu
+    "ອັດຕະປື": "attapeu",
+    "attapeu": "attapeu",
 }
 
-# 10-value canonical category set; omit if ambiguous rather than guess
+# 10-value canonical category set used by the platform.
+# Omit category (return None) rather than guess on ambiguous titles.
 CATEGORY_MAP = {
-    "information technology": "Technology",
-    "software": "Technology",
-    "developer": "Technology",
-    "programmer": "Technology",
-    "it support": "Technology",
-    "network": "Technology",
-    "data": "Technology",
-    "engineering": "Engineering",
-    "civil": "Engineering",
-    "electrical": "Engineering",
-    "mechanical": "Engineering",
-    "accounting": "Accounting & Finance",
-    "finance": "Accounting & Finance",
-    "audit": "Accounting & Finance",
+    # Engineering & IT
+    "information technology": "Engineering & IT",
+    "software": "Engineering & IT",
+    "developer": "Engineering & IT",
+    "programmer": "Engineering & IT",
+    "it support": "Engineering & IT",
+    "network": "Engineering & IT",
+    "data": "Engineering & IT",
+    "engineering": "Engineering & IT",
+    "civil": "Engineering & IT",
+    "electrical": "Engineering & IT",
+    "mechanical": "Engineering & IT",
+    # Banking & Finance
+    "accounting": "Banking & Finance",
+    "finance": "Banking & Finance",
+    "audit": "Banking & Finance",
     "banking": "Banking & Finance",
     "loan": "Banking & Finance",
     "credit": "Banking & Finance",
-    "marketing": "Marketing",
-    "digital marketing": "Marketing",
-    "brand": "Marketing",
-    "sales": "Sales",
-    "business development": "Sales",
-    "human resource": "Human Resources",
-    "hr ": "Human Resources",
-    "recruitment": "Human Resources",
-    "administration": "Administration",
-    "admin": "Administration",
-    "secretary": "Administration",
-    "education": "Education",
-    "teacher": "Education",
-    "training": "Education",
+    "insurance": "Banking & Finance",
+    # Sales & Marketing
+    "marketing": "Sales & Marketing",
+    "digital marketing": "Sales & Marketing",
+    "brand": "Sales & Marketing",
+    "sales": "Sales & Marketing",
+    "business development": "Sales & Marketing",
+    # Admin & HR
+    "human resource": "Admin & HR",
+    "hr ": "Admin & HR",
+    "recruitment": "Admin & HR",
+    "administration": "Admin & HR",
+    "admin": "Admin & HR",
+    "secretary": "Admin & HR",
+    "management": "Admin & HR",
+    "legal": "Admin & HR",
+    "operations": "Admin & HR",
+    "customer service": "Admin & HR",
+    # Education & Training
+    "education": "Education & Training",
+    "teacher": "Education & Training",
+    "training": "Education & Training",
+    # Healthcare
     "healthcare": "Healthcare",
     "health": "Healthcare",
     "nurse": "Healthcare",
     "doctor": "Healthcare",
+    "medical": "Healthcare",
+    # Hospitality & Tourism
     "hospitality": "Hospitality & Tourism",
     "hotel": "Hospitality & Tourism",
     "tourism": "Hospitality & Tourism",
     "restaurant": "Hospitality & Tourism",
+    # Logistics & Supply Chain
     "logistics": "Logistics & Supply Chain",
     "supply chain": "Logistics & Supply Chain",
     "warehouse": "Logistics & Supply Chain",
     "driver": "Logistics & Supply Chain",
+    "procurement": "Logistics & Supply Chain",
+    # Manufacturing
+    "construction": "Manufacturing",
+    "production": "Manufacturing",
+    "manufacturing": "Manufacturing",
+    # NGO & Development
+    "ngo": "NGO & Development",
+    "development": "NGO & Development",
+    "ingo": "NGO & Development",
+    "aid": "NGO & Development",
 }
 
+# Valid JobType enum values on the platform.
+# TEMPORARY is not valid — CONTRACT is the closest fallback.
 TYPE_MAP = {
     "full time": "FULL_TIME",
     "fulltime": "FULL_TIME",
@@ -136,7 +199,6 @@ TYPE_MAP = {
     "parttime": "PART_TIME",
     "part-time": "PART_TIME",
     "contract": "CONTRACT",
-    "temporary": "TEMPORARY",
     "internship": "INTERNSHIP",
     "intern": "INTERNSHIP",
     "freelance": "FREELANCE",
@@ -191,9 +253,9 @@ def _get_job_urls(soup: BeautifulSoup) -> list[str]:
 
 def _normalise_province(raw: str) -> str | None:
     low = raw.lower()
-    for key, prov in PROVINCE_MAP.items():
+    for key, slug in PROVINCE_MAP.items():
         if key in low:
-            return prov
+            return slug
     return None
 
 
@@ -291,10 +353,10 @@ def _parse_job(soup: BeautifulSoup, url: str) -> dict | None:
         salary_raw = salary_el.get_text(strip=True) if salary_el else ""
         salary_min, salary_max = parse_salary(salary_raw)
 
-        # Province
+        # Province (slug)
         province = _normalise_province(location)
 
-        # Category — try title first, then description
+        # Category — try title first, then full text
         full_text = f"{title} {description}"
         category = _infer_category(title) or _infer_category(full_text)
 
